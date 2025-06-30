@@ -1,11 +1,11 @@
-# LPR Parser Kernel Module
+# LPR dumper Kernel Module
 
 ## Module Information
-- **Name**: lpr_parser
+- **Name**: lpr_dumper
 - **Version**: 1.0
 - **License**: GPL
-- **Author**: LPR Parser
-- **Description**: Kernel module for LPR packet parsing and forwarding
+- **Author**: LPR dumper
+- **Description**: Kernel module for LPR packet dumping and forwarding
 
 ## Kernel API Usage
 
@@ -49,7 +49,7 @@ MODULE_PARM_DESC(server_port, "Target server port");
 
 Then load with parameters:
 ```bash
-sudo insmod lpr_parser.ko server_ip="192.168.1.100" server_port=9090
+sudo insmod lpr_dumper.ko server_ip="192.168.1.100" server_port=9090
 ```
 
 ## Debugging
@@ -143,14 +143,14 @@ MODULE_PARM_DESC(debug, "Enable debug output");
 ### Unit Testing
 ```bash
 # Load module
-sudo insmod lpr_parser.ko
+sudo insmod lpr_dumper.ko
 
 # Generate test traffic (if available)
 # Check kernel logs
 dmesg | grep LPR
 
 # Unload module
-sudo rmmod lpr_parser
+sudo rmmod lpr_dumper
 ```
 
 ### Integration Testing

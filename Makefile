@@ -1,6 +1,6 @@
 # Kernel module Makefile
-obj-m += lpr_parser.o
-lpr_parser-objs := main.o
+obj-m += lpr_dumper.o
+lpr_dumper-objs := main.o
 
 # Kernel build directory
 KDIR := /lib/modules/$(shell uname -r)/build
@@ -27,15 +27,15 @@ install-deps:
 
 # Load module
 load:
-	sudo insmod lpr_parser.ko
+	sudo insmod lpr_dumper.ko
 
 # Unload module
 unload:
-	sudo rmmod lpr_parser
+	sudo rmmod lpr_dumper
 
 # Show module info
 info:
-	modinfo lpr_parser.ko
+	modinfo lpr_dumper.ko
 
 # Show kernel messages
 logs:

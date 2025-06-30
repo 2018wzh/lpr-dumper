@@ -1,11 +1,11 @@
-# LPR Kernel Module Parser
+# LPR Kernel Module dumper
 
-This is a Linux kernel module written in C for capturing and parsing LPR (Line Printer Remote) packets. The module operates in kernel space, using netfilter hooks to intercept LPR traffic and forwards the parsed results to a specified server via TCP connection.
+This is a Linux kernel module written in C for capturing and dumping LPR (Line Printer Remote) packets. The module operates in kernel space, using netfilter hooks to intercept LPR traffic and forwards the parsed results to a specified server via TCP connection.
 
 ## Features
 
 - Real-time LPR packet capture using netfilter hooks (port 515)
-- Kernel-space LPR protocol parsing and command recognition
+- Kernel-space LPR protocol dumping and command recognition
 - Extract source/destination IP addresses and port information
 - Send parsed results in JSON format to remote server
 - Support for multiple LPR command types identification
@@ -41,7 +41,7 @@ sudo dnf install kernel-devel-$(uname -r) gcc make
 make
 ```
 
-This will compile the kernel module and create `lpr_parser.ko`.
+This will compile the kernel module and create `lpr_dumper.ko`.
 
 ## Usage
 
@@ -51,7 +51,7 @@ This will compile the kernel module and create `lpr_parser.ko`.
 # Load the module
 sudo make load
 # or manually
-sudo insmod lpr_parser.ko
+sudo insmod lpr_dumper.ko
 ```
 
 ### Configuration
@@ -67,7 +67,7 @@ Before loading the module, modify the server configuration in `main.c`:
 
 ```bash
 # Check if module is loaded
-lsmod | grep lpr_parser
+lsmod | grep lpr_dumper
 
 # View module information
 make info
@@ -80,7 +80,7 @@ dmesg | tail -20
 # Unload the module
 sudo make unload
 # or manually
-sudo rmmod lpr_parser
+sudo rmmod lpr_dumper
 ```
 
 ## Module Output
@@ -180,7 +180,7 @@ The module recognizes the following LPR commands:
 
 ```bash
 # Check module status
-cat /proc/modules | grep lpr_parser
+cat /proc/modules | grep lpr_dumper
 
 # Monitor kernel messages in real-time
 sudo dmesg -w

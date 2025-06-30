@@ -22,8 +22,8 @@
 
 // Module information
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("LPR Parser");
-MODULE_DESCRIPTION("Kernel module for LPR packet parsing and forwarding");
+MODULE_AUTHOR("LPR dumper");
+MODULE_DESCRIPTION("Kernel module for LPR packet dumping and forwarding");
 MODULE_VERSION("1.0");
 
 // LPR command types
@@ -307,7 +307,7 @@ static unsigned int lpr_hook_func(void *priv,
 }
 
 // Module initialization
-static int __init lpr_parser_init(void) {
+static int __init lpr_dumper_init(void) {
     int ret;
     
     printk(KERN_INFO "LPR: Kernel module loading...\n");
@@ -316,7 +316,7 @@ static int __init lpr_parser_init(void) {
     mutex_init(&socket_mutex);
     
     // Create workqueue
-    lpr_wq = create_workqueue("lpr_parser_wq");
+    lpr_wq = create_workqueue("lpr_dumper_wq");
     if (!lpr_wq) {
         printk(KERN_ERR "LPR: Failed to create workqueue\n");
         return -ENOMEM;
@@ -343,7 +343,7 @@ static int __init lpr_parser_init(void) {
 }
 
 // Module cleanup
-static void __exit lpr_parser_exit(void) {
+static void __exit lpr_dumper_exit(void) {
     printk(KERN_INFO "LPR: Module unloading...\n");
     
     // Set running flag to false
@@ -369,5 +369,5 @@ static void __exit lpr_parser_exit(void) {
     printk(KERN_INFO "LPR: Module unloaded successfully\n");
 }
 
-module_init(lpr_parser_init);
-module_exit(lpr_parser_exit);
+module_init(lpr_dumper_init);
+module_exit(lpr_dumper_exit);
