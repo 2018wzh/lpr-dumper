@@ -1,21 +1,30 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netinet/ip.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
-#include <pcap.h>
-#include <errno.h>
-#include <time.h>
-#include <signal.h>
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/netfilter.h>
+#include <linux/netfilter_ipv4.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include <linux/socket.h>
+#include <linux/in.h>
+#include <net/sock.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/time.h>
+#include <linux/kthread.h>
+#include <linux/delay.h>
+#include <linux/mutex.h>
 
 #define LPR_PORT 515
 #define BUFFER_SIZE 4096
 #define SERVER_IP "127.0.0.1"  // Target server IP
 #define SERVER_PORT 8080       // Target server port
+
+// Module information
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("LPR Parser");
+MODULE_DESCRIPTION("Kernel module for LPR packet parsing and forwarding");
+MODULE_VERSION("1.0");
 
 // LPR command types
 #define LPR_PRINT_JOB 0x02
@@ -25,180 +34,201 @@
 #define LPR_REMOVE_JOBS 0x05
 
 // Global variables
-static volatile int running = 1;
-static int server_socket = -1;
+static struct nf_hook_ops nfho;
+static struct socket *server_sock = NULL;
+static struct task_struct *worker_thread = NULL;
+static struct mutex socket_mutex;
+static bool module_running = true;
 
 // LPR packet structure
 typedef struct {
-    uint8_t command;
+    u8 command;
     char queue_name[256];
     char data[BUFFER_SIZE];
     size_t data_len;
-    time_t timestamp;
-    char src_ip[INET_ADDRSTRLEN];
-    char dst_ip[INET_ADDRSTRLEN];
-    uint16_t src_port;
-    uint16_t dst_port;
+    long timestamp;
+    __be32 src_ip;
+    __be32 dst_ip;
+    u16 src_port;
+    u16 dst_port;
 } lpr_packet_t;
 
-// Signal handler function
-void signal_handler(int sig) {
-    printf("\nCaught signal %d, exiting...\n", sig);
-    running = 0;
+// Work queue for processing packets
+static struct workqueue_struct *lpr_wq;
+
+typedef struct {
+    struct work_struct work;
+    lpr_packet_t packet;
+} lpr_work_t;
+
+// Convert IP address to string
+static void ip_to_string(__be32 ip, char *str) {
+    u8 *bytes = (u8*)&ip;
+    snprintf(str, 16, "%u.%u.%u.%u", bytes[0], bytes[1], bytes[2], bytes[3]);
+}
+
+// Convert string IP to binary
+static __be32 string_to_ip(const char *str) {
+    u8 a, b, c, d;
+    if (sscanf(str, "%hhu.%hhu.%hhu.%hhu", &a, &b, &c, &d) == 4) {
+        return (a << 0) | (b << 8) | (c << 16) | (d << 24);
+    }
+    return 0;
 }
 
 // Connect to server
-int connect_to_server() {
-    int sock;
+static int connect_to_server(void) {
     struct sockaddr_in server_addr;
+    int ret;
     
-    sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        perror("Failed to create socket");
-        return -1;
+    if (server_sock) {
+        return 0; // Already connected
+    }
+    
+    ret = sock_create(AF_INET, SOCK_STREAM, IPPROTO_TCP, &server_sock);
+    if (ret < 0) {
+        printk(KERN_ERR "LPR: Failed to create socket: %d\n", ret);
+        return ret;
     }
     
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(SERVER_PORT);
+    server_addr.sin_addr.s_addr = string_to_ip(SERVER_IP);
     
-    if (inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr) <= 0) {
-        perror("Invalid IP address");
-        close(sock);
-        return -1;
+    ret = server_sock->ops->connect(server_sock, (struct sockaddr*)&server_addr, 
+                                   sizeof(server_addr), 0);
+    if (ret < 0) {
+        printk(KERN_ERR "LPR: Failed to connect to server: %d\n", ret);
+        sock_release(server_sock);
+        server_sock = NULL;
+        return ret;
     }
     
-    if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        perror("Failed to connect to server");
-        close(sock);
-        return -1;
-    }
-    
-    printf("Successfully connected to server %s:%d\n", SERVER_IP, SERVER_PORT);
-    return sock;
+    printk(KERN_INFO "LPR: Successfully connected to server %s:%d\n", 
+           SERVER_IP, SERVER_PORT);
+    return 0;
 }
 
 // Send data to server
-int send_to_server(const lpr_packet_t* packet) {
-    if (server_socket < 0) {
-        server_socket = connect_to_server();
-        if (server_socket < 0) {
-            return -1;
-        }
-    }
-    
-    // Construct JSON formatted data
+static int send_to_server(const lpr_packet_t* packet) {
+    struct msghdr msg;
+    struct kvec iov;
     char json_data[BUFFER_SIZE * 2];
-    char time_str[64];
-    struct tm* tm_info = localtime(&packet->timestamp);
-    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", tm_info);
+    char src_ip_str[16], dst_ip_str[16];
+    int ret, json_len;
     
-    // Simple escape processing for data
-    char escaped_data[BUFFER_SIZE * 2];
-    const char* src = packet->data;
-    char* dst = escaped_data;
-    size_t i = 0;
+    mutex_lock(&socket_mutex);
     
-    while (i < packet->data_len && dst < escaped_data + sizeof(escaped_data) - 2) {
-        if (*src == '"' || *src == '\\') {
-            *dst++ = '\\';
+    if (!server_sock) {
+        ret = connect_to_server();
+        if (ret < 0) {
+            mutex_unlock(&socket_mutex);
+            return ret;
         }
-        if (*src >= 32 && *src <= 126) {  // Printable characters
-            *dst++ = *src;
-        } else {
-            // Non-printable characters in hex format
-            snprintf(dst, 5, "\\x%02x", (unsigned char)*src);
-            dst += 4;
-        }
-        src++;
-        i++;
     }
-    *dst = '\0';
     
-    int json_len = snprintf(json_data, sizeof(json_data),
+    // Convert IP addresses to strings
+    ip_to_string(packet->src_ip, src_ip_str);
+    ip_to_string(packet->dst_ip, dst_ip_str);
+    
+    // Create JSON data
+    json_len = snprintf(json_data, sizeof(json_data),
         "{\n"
-        "  \"timestamp\": \"%s\",\n"
+        "  \"timestamp\": %ld,\n"
         "  \"src_ip\": \"%s\",\n"
         "  \"dst_ip\": \"%s\",\n"
         "  \"src_port\": %u,\n"
         "  \"dst_port\": %u,\n"
         "  \"lpr_command\": %u,\n"
-        "  \"queue_name\": \"%s\",\n"
-        "  \"data_length\": %zu,\n"
-        "  \"data\": \"%s\"\n"
+        "  \"queue_name\": \"%.255s\",\n"
+        "  \"data_length\": %zu\n"
         "}\n",
-        time_str, packet->src_ip, packet->dst_ip,
+        packet->timestamp, src_ip_str, dst_ip_str,
         packet->src_port, packet->dst_port,
         packet->command, packet->queue_name,
-        packet->data_len, escaped_data);
+        packet->data_len);
     
-    if (send(server_socket, json_data, json_len, 0) < 0) {
-        perror("Failed to send data");
-        close(server_socket);
-        server_socket = -1;
-        return -1;
+    // Prepare message
+    memset(&msg, 0, sizeof(msg));
+    iov.iov_base = json_data;
+    iov.iov_len = json_len;
+    
+    ret = kernel_sendmsg(server_sock, &msg, &iov, 1, json_len);
+    if (ret < 0) {
+        printk(KERN_ERR "LPR: Failed to send data: %d\n", ret);
+        sock_release(server_sock);
+        server_sock = NULL;
+    } else {
+        printk(KERN_INFO "LPR: Sent packet info to server (%zu bytes)\n", 
+               packet->data_len);
     }
     
-    printf("Sent LPR packet info to server (%zu bytes)\n", packet->data_len);
-    return 0;
+    mutex_unlock(&socket_mutex);
+    return ret;
 }
 
 // Parse LPR packet
-void parse_lpr_packet(const u_char* packet_data, size_t data_len, 
-                     const char* src_ip, const char* dst_ip,
-                     uint16_t src_port, uint16_t dst_port) {
+static void parse_lpr_packet(const unsigned char* packet_data, size_t data_len,
+                           __be32 src_ip, __be32 dst_ip,
+                           u16 src_port, u16 dst_port) {
+    lpr_packet_t lpr_packet;
+    char src_ip_str[16], dst_ip_str[16];
     
     if (data_len == 0) return;
     
-    lpr_packet_t lpr_packet;
     memset(&lpr_packet, 0, sizeof(lpr_packet));
     
     // Set basic information
-    lpr_packet.timestamp = time(NULL);
-    strcpy(lpr_packet.src_ip, src_ip);
-    strcpy(lpr_packet.dst_ip, dst_ip);
+    lpr_packet.timestamp = ktime_get_real_seconds();
+    lpr_packet.src_ip = src_ip;
+    lpr_packet.dst_ip = dst_ip;
     lpr_packet.src_port = src_port;
     lpr_packet.dst_port = dst_port;
     
     // Parse LPR command
     lpr_packet.command = packet_data[0];
     
+    // Convert IP addresses for printing
+    ip_to_string(src_ip, src_ip_str);
+    ip_to_string(dst_ip, dst_ip_str);
+    
     // Parse data according to command type
     switch (lpr_packet.command) {
-        case 0x01: // Print waiting jobs
-            printf("LPR Command: Print waiting jobs\n");
+        case 0x01:
+            printk(KERN_INFO "LPR: Command - Print waiting jobs\n");
             if (data_len > 1) {
                 strncpy(lpr_packet.queue_name, (char*)(packet_data + 1), 
                        sizeof(lpr_packet.queue_name) - 1);
             }
             break;
             
-        case 0x02: // Receive a printer job
-            printf("LPR Command: Receive a printer job\n");
+        case 0x02:
+            printk(KERN_INFO "LPR: Command - Receive a printer job\n");
             if (data_len > 1) {
                 strncpy(lpr_packet.queue_name, (char*)(packet_data + 1), 
                        sizeof(lpr_packet.queue_name) - 1);
             }
             break;
             
-        case 0x03: // Send queue state
-            printf("LPR Command: Send queue state\n");
+        case 0x03:
+            printk(KERN_INFO "LPR: Command - Send queue state\n");
             if (data_len > 1) {
                 strncpy(lpr_packet.queue_name, (char*)(packet_data + 1), 
                        sizeof(lpr_packet.queue_name) - 1);
             }
             break;
             
-        case 0x04: // Send queue state (long)
-            printf("LPR Command: Send queue state (detailed)\n");
+        case 0x04:
+            printk(KERN_INFO "LPR: Command - Send queue state (detailed)\n");
             if (data_len > 1) {
                 strncpy(lpr_packet.queue_name, (char*)(packet_data + 1), 
                        sizeof(lpr_packet.queue_name) - 1);
             }
             break;
             
-        case 0x05: // Remove jobs
-            printf("LPR Command: Remove jobs\n");
+        case 0x05:
+            printk(KERN_INFO "LPR: Command - Remove jobs\n");
             if (data_len > 1) {
                 strncpy(lpr_packet.queue_name, (char*)(packet_data + 1), 
                        sizeof(lpr_packet.queue_name) - 1);
@@ -206,7 +236,7 @@ void parse_lpr_packet(const u_char* packet_data, size_t data_len,
             break;
             
         default:
-            printf("Unknown LPR command: 0x%02x\n", lpr_packet.command);
+            printk(KERN_INFO "LPR: Unknown command: 0x%02x\n", lpr_packet.command);
             break;
     }
     
@@ -216,146 +246,128 @@ void parse_lpr_packet(const u_char* packet_data, size_t data_len,
     memcpy(lpr_packet.data, packet_data, copy_len);
     lpr_packet.data_len = copy_len;
     
-    printf("Parsed LPR packet: %s:%u -> %s:%u, command=0x%02x, queue='%s', data_len=%zu\n",
-           src_ip, src_port, dst_ip, dst_port, 
+    printk(KERN_INFO "LPR: Parsed packet: %s:%u -> %s:%u, cmd=0x%02x, queue='%s', len=%zu\n",
+           src_ip_str, src_port, dst_ip_str, dst_port, 
            lpr_packet.command, lpr_packet.queue_name, lpr_packet.data_len);
     
     // Send to server
     send_to_server(&lpr_packet);
 }
 
-// Packet handler callback function
-void packet_handler(u_char* user_data, const struct pcap_pkthdr* pkthdr, 
-                   const u_char* packet) {
+// Work function for packet processing
+static void lpr_work_handler(struct work_struct *work) {
+    lpr_work_t *lpr_work = container_of(work, lpr_work_t, work);
     
-    // Parse Ethernet header
-    struct iphdr* ip_header = (struct iphdr*)(packet + 14); // Skip Ethernet header
+    // Process the packet (already parsed, just send to server)
+    send_to_server(&lpr_work->packet);
     
-    // Check if it's TCP protocol
-    if (ip_header->protocol != IPPROTO_TCP) {
-        return;
+    kfree(lpr_work);
+}
+
+// Netfilter hook function
+static unsigned int lpr_hook_func(void *priv,
+                                 struct sk_buff *skb,
+                                 const struct nf_hook_state *state) {
+    struct iphdr *ip_header;
+    struct tcphdr *tcp_header;
+    unsigned char *tcp_data;
+    unsigned int tcp_data_len;
+    u16 src_port, dst_port;
+    
+    if (!skb) return NF_ACCEPT;
+    
+    ip_header = ip_hdr(skb);
+    if (!ip_header || ip_header->protocol != IPPROTO_TCP) {
+        return NF_ACCEPT;
     }
     
-    // Parse TCP header
-    struct tcphdr* tcp_header = (struct tcphdr*)((u_char*)ip_header + (ip_header->ihl * 4));
+    tcp_header = tcp_hdr(skb);
+    if (!tcp_header) return NF_ACCEPT;
     
-    uint16_t src_port = ntohs(tcp_header->source);
-    uint16_t dst_port = ntohs(tcp_header->dest);
+    src_port = ntohs(tcp_header->source);
+    dst_port = ntohs(tcp_header->dest);
     
     // Check if it's LPR port
     if (src_port != LPR_PORT && dst_port != LPR_PORT) {
-        return;
+        return NF_ACCEPT;
     }
-    
-    // Get IP addresses
-    char src_ip[INET_ADDRSTRLEN];
-    char dst_ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &ip_header->saddr, src_ip, INET_ADDRSTRLEN);
-    inet_ntop(AF_INET, &ip_header->daddr, dst_ip, INET_ADDRSTRLEN);
-    
-    // Calculate TCP data offset
-    int tcp_header_len = tcp_header->doff * 4;
-    int ip_header_len = ip_header->ihl * 4;
-    int total_header_len = 14 + ip_header_len + tcp_header_len; // Ethernet + IP + TCP
     
     // Get TCP data
-    if (pkthdr->caplen > total_header_len) {
-        const u_char* tcp_data = packet + total_header_len;
-        size_t tcp_data_len = pkthdr->caplen - total_header_len;
+    tcp_data_len = ntohs(ip_header->tot_len) - (ip_header->ihl * 4) - (tcp_header->doff * 4);
+    if (tcp_data_len > 0) {
+        tcp_data = (unsigned char *)tcp_header + (tcp_header->doff * 4);
         
-        if (tcp_data_len > 0) {
-            parse_lpr_packet(tcp_data, tcp_data_len, src_ip, dst_ip, src_port, dst_port);
-        }
+        // Parse LPR packet
+        parse_lpr_packet(tcp_data, tcp_data_len,
+                        ip_header->saddr, ip_header->daddr,
+                        src_port, dst_port);
     }
+    
+    return NF_ACCEPT;
 }
 
-int main(int argc, char* argv[]) {
-    pcap_t* handle;
-    char errbuf[PCAP_ERRBUF_SIZE];
-    char* device = NULL;
-    struct bpf_program filter;
-    char filter_exp[] = "tcp port 515";  // LPR port filter
-    bpf_u_int32 net, mask;
+// Module initialization
+static int __init lpr_parser_init(void) {
+    int ret;
     
-    printf("LPR Packet Parser started...\n");
+    printk(KERN_INFO "LPR: Kernel module loading...\n");
     
-    // Register signal handlers
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
+    // Initialize mutex
+    mutex_init(&socket_mutex);
     
-    // If no device specified, automatically select default device
-    if (argc > 1) {
-        device = argv[1];
-    } else {
-        device = pcap_lookupdev(errbuf);
-        if (device == NULL) {
-            fprintf(stderr, "Cannot find default device: %s\n", errbuf);
-            return 1;
-        }
+    // Create workqueue
+    lpr_wq = create_workqueue("lpr_parser_wq");
+    if (!lpr_wq) {
+        printk(KERN_ERR "LPR: Failed to create workqueue\n");
+        return -ENOMEM;
     }
     
-    printf("Using device: %s\n", device);
+    // Setup netfilter hook
+    nfho.hook = lpr_hook_func;
+    nfho.hooknum = NF_INET_PRE_ROUTING;
+    nfho.pf = PF_INET;
+    nfho.priority = NF_IP_PRI_FIRST;
     
-    // Get network information
-    if (pcap_lookupnet(device, &net, &mask, errbuf) == -1) {
-        fprintf(stderr, "Cannot get device information: %s\n", errbuf);
-        net = 0;
-        mask = 0;
+    ret = nf_register_net_hook(&init_net, &nfho);
+    if (ret) {
+        printk(KERN_ERR "LPR: Failed to register netfilter hook: %d\n", ret);
+        destroy_workqueue(lpr_wq);
+        return ret;
     }
     
-    // Open device for capture
-    handle = pcap_open_live(device, BUFFER_SIZE, 1, 1000, errbuf);
-    if (handle == NULL) {
-        fprintf(stderr, "Cannot open device %s: %s\n", device, errbuf);
-        return 1;
-    }
+    printk(KERN_INFO "LPR: Module loaded successfully\n");
+    printk(KERN_INFO "LPR: Monitoring LPR traffic on port %d\n", LPR_PORT);
+    printk(KERN_INFO "LPR: Target server: %s:%d\n", SERVER_IP, SERVER_PORT);
     
-    // Check data link layer type
-    if (pcap_datalink(handle) != DLT_EN10MB) {
-        fprintf(stderr, "Device %s does not support Ethernet\n", device);
-        pcap_close(handle);
-        return 1;
-    }
-    
-    // Compile and apply filter
-    if (pcap_compile(handle, &filter, filter_exp, 0, net) == -1) {
-        fprintf(stderr, "Cannot compile filter %s: %s\n", filter_exp, pcap_geterr(handle));
-        pcap_close(handle);
-        return 1;
-    }
-    
-    if (pcap_setfilter(handle, &filter) == -1) {
-        fprintf(stderr, "Cannot set filter %s: %s\n", filter_exp, pcap_geterr(handle));
-        pcap_close(handle);
-        return 1;
-    }
-    
-    printf("Started listening for LPR packets...\n");
-    printf("Filter: %s\n", filter_exp);
-    printf("Target server: %s:%d\n", SERVER_IP, SERVER_PORT);
-    printf("Press Ctrl+C to exit\n\n");
-    
-    // Start capturing packets
-    while (running) {
-        int result = pcap_loop(handle, 1, packet_handler, NULL);
-        if (result == -1) {
-            fprintf(stderr, "pcap_loop error: %s\n", pcap_geterr(handle));
-            break;
-        } else if (result == -2) {
-            // pcap_breakloop was called
-            break;
-        }
-    }
-    
-    // Cleanup resources
-    printf("\nCleaning up resources...\n");
-    pcap_freecode(&filter);
-    pcap_close(handle);
-    
-    if (server_socket >= 0) {
-        close(server_socket);
-    }
-    
-    printf("Program exited\n");
     return 0;
 }
+
+// Module cleanup
+static void __exit lpr_parser_exit(void) {
+    printk(KERN_INFO "LPR: Module unloading...\n");
+    
+    // Set running flag to false
+    module_running = false;
+    
+    // Unregister netfilter hook
+    nf_unregister_net_hook(&init_net, &nfho);
+    
+    // Cleanup workqueue
+    if (lpr_wq) {
+        flush_workqueue(lpr_wq);
+        destroy_workqueue(lpr_wq);
+    }
+    
+    // Close server connection
+    mutex_lock(&socket_mutex);
+    if (server_sock) {
+        sock_release(server_sock);
+        server_sock = NULL;
+    }
+    mutex_unlock(&socket_mutex);
+    
+    printk(KERN_INFO "LPR: Module unloaded successfully\n");
+}
+
+module_init(lpr_parser_init);
+module_exit(lpr_parser_exit);

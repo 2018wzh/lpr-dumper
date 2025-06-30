@@ -1,22 +1,44 @@
-CC = gcc
-CFLAGS = -Wall -Wextra -std=c99 -O2
-LIBS = -lpcap
-TARGET = lpr-parser
-SOURCE = main.c
+# Kernel module Makefile
+obj-m += lpr_parser.o
+lpr_parser-objs := main.o
 
-$(TARGET): $(SOURCE)
-	$(CC) $(CFLAGS) -o $(TARGET) $(SOURCE) $(LIBS)
+# Kernel build directory
+KDIR := /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
 
+# Default target
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+# Clean target
 clean:
-	rm -f $(TARGET)
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+	rm -f *.o *.ko *.mod.c *.mod *.order *.symvers
 
+# Install dependencies
 install-deps:
-	@echo "安装依赖包 (Ubuntu/Debian):"
+	@echo "Installing dependencies (Ubuntu/Debian):"
 	sudo apt-get update
-	sudo apt-get install -y libpcap-dev gcc make
-	@echo "安装依赖包 (CentOS/RHEL):"
-	@echo "sudo yum install libpcap-devel gcc make"
-	@echo "或者:"
-	@echo "sudo dnf install libpcap-devel gcc make"
+	sudo apt-get install -y linux-headers-$(shell uname -r) build-essential
+	@echo "Installing dependencies (CentOS/RHEL):"
+	@echo "sudo yum install kernel-devel-$(shell uname -r) gcc make"
+	@echo "or:"
+	@echo "sudo dnf install kernel-devel-$(shell uname -r) gcc make"
 
-.PHONY: clean install-deps
+# Load module
+load:
+	sudo insmod lpr_parser.ko
+
+# Unload module
+unload:
+	sudo rmmod lpr_parser
+
+# Show module info
+info:
+	modinfo lpr_parser.ko
+
+# Show kernel messages
+logs:
+	dmesg | tail -20
+
+.PHONY: all clean install-deps load unload info logs

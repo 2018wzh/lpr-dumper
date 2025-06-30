@@ -1,169 +1,212 @@
-# LPR数据包解析器
+# LPR Kernel Module Parser
 
-这是一个用C语言编写的Linux系统LPR（Line Printer Remote）数据包捕获和解析程序。该程序可以监听网络接口上的LPR流量，解析数据包内容，并通过TCP连接将解析结果发送到指定服务器。
+This is a Linux kernel module written in C for capturing and parsing LPR (Line Printer Remote) packets. The module operates in kernel space, using netfilter hooks to intercept LPR traffic and forwards the parsed results to a specified server via TCP connection.
 
-## 功能特性
+## Features
 
-- 实时捕获网络接口上的LPR数据包（端口515）
-- 解析LPR协议命令和数据
-- 提取源/目标IP地址和端口信息
-- 将解析结果以JSON格式发送到远程服务器
-- 支持多种LPR命令类型识别
-- 优雅的信号处理和资源清理
+- Real-time LPR packet capture using netfilter hooks (port 515)
+- Kernel-space LPR protocol parsing and command recognition
+- Extract source/destination IP addresses and port information
+- Send parsed results in JSON format to remote server
+- Support for multiple LPR command types identification
+- Kernel module with proper initialization and cleanup
 
-## 依赖要求
+## Requirements
 
-- Linux操作系统
-- libpcap开发库
-- gcc编译器
-- root权限（用于网络数据包捕获）
+- Linux operating system with kernel headers
+- GCC compiler and build tools
+- Root privileges (for module loading/unloading)
+- Target server to receive parsed data
 
-## 编译安装
+## Build and Installation
 
-### 1. 安装依赖
+### 1. Install Dependencies
 
-**Ubuntu/Debian系统:**
+**Ubuntu/Debian systems:**
 ```bash
 sudo apt-get update
-sudo apt-get install libpcap-dev gcc make
+sudo apt-get install linux-headers-$(uname -r) build-essential
 ```
 
-**CentOS/RHEL系统:**
+**CentOS/RHEL systems:**
 ```bash
-sudo yum install libpcap-devel gcc make
-# 或者对于较新版本
-sudo dnf install libpcap-devel gcc make
+sudo yum install kernel-devel-$(uname -r) gcc make
+# or for newer versions
+sudo dnf install kernel-devel-$(uname -r) gcc make
 ```
 
-### 2. 编译程序
+### 2. Build the Module
 
 ```bash
 make
 ```
 
-或者手动编译：
-```bash
-gcc -Wall -Wextra -std=c99 -O2 -o lpr-parser main.c -lpcap
-```
+This will compile the kernel module and create `lpr_parser.ko`.
 
-## 使用方法
+## Usage
 
-### 基本用法
+### Loading the Module
 
 ```bash
-# 使用默认网卡监听LPR数据包
-sudo ./lpr-parser
-
-# 指定网卡接口
-sudo ./lpr-parser eth0
+# Load the module
+sudo make load
+# or manually
+sudo insmod lpr_parser.ko
 ```
 
-### 配置说明
+### Configuration
 
-在运行前，请修改 `main.c` 中的服务器配置：
+Before loading the module, modify the server configuration in `main.c`:
 
 ```c
-#define SERVER_IP "127.0.0.1"  // 修改为目标服务器IP
-#define SERVER_PORT 8080       // 修改为目标服务器端口
+#define SERVER_IP "127.0.0.1"  // Change to target server IP
+#define SERVER_PORT 8080       // Change to target server port
 ```
 
-## 程序输出
+### Module Operations
 
-程序会实时显示捕获到的LPR数据包信息，包括：
-- 时间戳
-- 源IP和端口
-- 目标IP和端口
-- LPR命令类型
-- 队列名称
-- 数据长度
+```bash
+# Check if module is loaded
+lsmod | grep lpr_parser
 
-示例输出：
-```
-LPR数据包解析器启动...
-使用网卡: eth0
-开始监听LPR数据包...
-过滤器: tcp port 515
-目标服务器: 192.168.1.100:8080
-按 Ctrl+C 退出
+# View module information
+make info
 
-LPR命令: 接收打印作业
-解析LPR数据包: 192.168.1.10:12345 -> 192.168.1.20:515, 命令=0x02, 队列='printer1', 数据长度=1024
-已发送LPR数据包信息到服务器 (1024字节)
+# Check kernel messages (module output)
+make logs
+# or
+dmesg | tail -20
+
+# Unload the module
+sudo make unload
+# or manually
+sudo rmmod lpr_parser
 ```
 
-## JSON数据格式
+## Module Output
 
-发送到服务器的数据采用JSON格式：
+The module outputs information to kernel log, which can be viewed with `dmesg`:
+
+```
+LPR: Module loaded successfully
+LPR: Monitoring LPR traffic on port 515
+LPR: Target server: 192.168.1.100:8080
+LPR: Command - Receive a printer job
+LPR: Parsed packet: 192.168.1.10:12345 -> 192.168.1.20:515, cmd=0x02, queue='printer1', len=1024
+LPR: Successfully connected to server 192.168.1.100:8080
+LPR: Sent packet info to server (1024 bytes)
+```
+
+## JSON Data Format
+
+Data sent to the server uses JSON format:
 
 ```json
 {
-  "timestamp": "2025-06-30 10:30:45",
+  "timestamp": 1719734445,
   "src_ip": "192.168.1.10",
   "dst_ip": "192.168.1.20",
   "src_port": 12345,
   "dst_port": 515,
   "lpr_command": 2,
   "queue_name": "printer1",
-  "data_length": 1024,
-  "data": "打印作业数据内容..."
+  "data_length": 1024
 }
 ```
 
-## LPR命令类型
+## Supported LPR Commands
 
-程序识别以下LPR命令：
+The module recognizes the following LPR commands:
 
-- `0x01`: 打印等待作业
-- `0x02`: 接收打印作业
-- `0x03`: 发送队列状态
-- `0x04`: 发送队列状态（详细）
-- `0x05`: 删除作业
+- `0x01`: Print waiting jobs
+- `0x02`: Receive a printer job
+- `0x03`: Send queue state
+- `0x04`: Send queue state (detailed)
+- `0x05`: Remove jobs
 
-## 注意事项
+## Architecture
 
-1. **权限要求**: 程序需要root权限才能捕获网络数据包
-2. **网络接口**: 确保指定的网络接口存在且处于活动状态
-3. **防火墙**: 确保能够连接到目标服务器
-4. **服务器连接**: 程序会自动重连断开的服务器连接
+### Netfilter Hook
+- Uses `NF_INET_PRE_ROUTING` hook to capture packets early in the network stack
+- Filters TCP packets on port 515 (LPR)
+- Operates with `NF_IP_PRI_FIRST` priority
 
-## 故障排除
+### Kernel Socket API
+- Creates TCP socket using `sock_create()`
+- Uses `kernel_sendmsg()` for data transmission
+- Automatic reconnection on connection failure
 
-### 常见问题
+### Work Queue
+- Uses kernel workqueue for non-blocking packet processing
+- Ensures network operations don't block packet processing
 
-1. **权限错误**
+## Important Notes
+
+1. **Kernel Space**: Module runs in kernel space with kernel APIs
+2. **Root Privileges**: Requires root to load/unload modules
+3. **System Impact**: Monitor system performance when loaded
+4. **Memory Management**: Uses kernel memory allocation (`kmalloc`/`kfree`)
+5. **Network Security**: Ensure target server connection is secure
+
+## Troubleshooting
+
+### Common Issues
+
+1. **Module compilation failed**
    ```
-   无法打开网卡: Operation not permitted
+   make: *** No rule to make target 'modules'
    ```
-   解决方案: 使用 `sudo` 运行程序
+   Solution: Install kernel headers for your kernel version
 
-2. **找不到网卡**
+2. **Module loading failed**
    ```
-   无法找到默认网卡
+   insmod: ERROR: could not insert module
    ```
-   解决方案: 手动指定网卡名称，如 `sudo ./lpr-parser eth0`
+   Solution: Check `dmesg` for specific error messages
 
-3. **连接服务器失败**
+3. **No packets captured**
    ```
-   连接服务器失败: Connection refused
+   Module loaded but no LPR traffic detected
    ```
-   解决方案: 检查服务器IP和端口配置，确保服务器正在运行
+   Solution: Verify LPR traffic is present on the network
 
-### 调试模式
+4. **Server connection failed**
+   ```
+   LPR: Failed to connect to server: -111
+   ```
+   Solution: Check server IP/port configuration and network connectivity
 
-可以修改代码中的打印语句来获得更详细的调试信息。
-
-## 安全考虑
-
-- 程序会捕获网络流量，请确保符合当地法律法规
-- 建议在测试环境中使用
-- 传输的数据可能包含敏感信息，请确保服务器连接安全
-
-## 清理
+### Debug Commands
 
 ```bash
-make clean
+# Check module status
+cat /proc/modules | grep lpr_parser
+
+# Monitor kernel messages in real-time
+sudo dmesg -w
+
+# Check network connections
+ss -tuln | grep 8080
 ```
 
-## 许可证
+## Clean Up
 
-本程序仅供学习和测试使用。
+```bash
+# Clean build files
+make clean
+
+# Remove module if loaded
+sudo make unload
+```
+
+## Security Considerations
+
+- Module operates with kernel privileges
+- Network traffic capture may contain sensitive information
+- Ensure compliance with local laws and regulations
+- Use in controlled environments for testing
+- Secure communication with target server
+
+## License
+
+This kernel module is provided for educational and testing purposes under GPL license.
